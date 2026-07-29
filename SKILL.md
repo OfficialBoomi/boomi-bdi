@@ -105,11 +105,11 @@ Run scripts from the project workspace directory (so `.env` and `active-developm
 
 All scripts support `--help` (or run with no args) for usage. They emit the API's raw response to stdout and errors to stderr — read the JSON directly rather than transforming it.
 
-**Pipeline discipline.** Pipe script output only to standard text filters (`head`, `tail`, `wc`, `grep`). Do **not** pipe to `python3 -c`, `jq -r`, `awk`, or other interpreters with inline code — the Claude Code harness treats each piped executable as a separate trust boundary and prompts for approval per pipe, defeating the point of allowlisting the scripts.
+**Pipeline discipline.** Pipe script output only to standard text filters (`head`, `tail`, `wc`, `grep`). Do **not** pipe to `python3 -c`, `jq -r`, `awk`, or other interpreters with inline code — a harness that treats each piped executable as its own trust boundary prompts for approval per pipe, defeating the point of allowlisting the scripts.
 
-**Temp files stay in the project tree.** When you need a scratch file (a JSON body for `create`), write it under `active-development/` — not `/tmp/`. The harness prompts for approval on writes outside the project tree.
+**Temp files stay in the project tree.** When you need a scratch file (a JSON body for `create`), write it under `active-development/` — not `/tmp/`. A write outside the project tree commonly triggers an approval prompt.
 
-**Use the Write tool, not bash heredocs.** Create the file with a separate **Write** tool call, then invoke the script with a separate **Bash** call — combined heredoc-plus-invocation commands trigger harness approval prompts.
+**Write files with a file-writing tool, not bash heredocs.** Create the file in one call, then invoke the script in a separate shell call — a combined heredoc-plus-invocation command reads as new shell code and triggers an approval prompt.
 
 - `scripts/bdi-env-check.sh` — verify `.env`, reach the API, list the environments the token can see. Use when: starting work, or choosing `BDI_ENVIRONMENT_ID`. It lists one page and says so if more exist — on an account with many environments, enumerate with `bdi-env.sh list --all` before recommending one.
 - `scripts/bdi-env.sh` — `list | get | create | edit` for environments (account-scoped — needs `BDI_ACCOUNT_ID`, not `BDI_ENVIRONMENT_ID`); `audit | audit-get` for audit events (environment-scoped). Use when: discovering, creating, or editing environments, or reviewing an environment's audit-event history.
