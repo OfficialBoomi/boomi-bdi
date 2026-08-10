@@ -228,20 +228,33 @@ _paginate_check() {
   return 0
 }
 
-# Poll GET operations/{op_id} until status is terminal. RESPONSE_BODY holds the last response.
+# Poll GET operations/{op_id} until status is terminal. RESPONSE_BODY/RESPONSE_CODE hold the last
+# successful response.
 #   args: <op-id> <timeout-secs> <interval-secs>
-#   returns: 0 terminal · 1 timed out · 2 a get call failed
+#   returns: 0 terminal · 1 timed out · 2 the get call failed POLL_MAX_FAILS times in a row
+# Only transport failures count toward POLL_MAX_FAILS; an HTTP error response carries no status,
+# so it just polls again until the timeout.
+POLL_MAX_FAILS=3
 poll_operation() {
   local op_id="$1" timeout="$2" interval="$3"
-  local elapsed=0 status
+  local elapsed=0 status fails=0 last_body="" last_code=""
   while :; do
-    bdi_api "$(bdi_env_url "operations/$op_id")" || return 2
-    status=$(printf '%s' "$RESPONSE_BODY" \
-      | grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]+"' \
-      | head -1 \
-      | sed -E 's/.*"([^"]+)"$/\1/') || true
-    case "$status" in E|D) return 0 ;; esac  # E=error, D=done — both terminal
+    if bdi_api "$(bdi_env_url "operations/$op_id")"; then
+      fails=0
+      last_body="$RESPONSE_BODY" last_code="$RESPONSE_CODE"
+      status=$(printf '%s' "$RESPONSE_BODY" \
+        | grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | head -1 \
+        | sed -E 's/.*"([^"]+)"$/\1/') || true
+      case "$status" in E|D) return 0 ;; esac  # E=error, D=done — both terminal
+    else
+      # a failed call empties both; keep the last real pair for the caller
+      RESPONSE_BODY="$last_body" RESPONSE_CODE="$last_code"
+      (( fails += 1 ))
+      (( fails >= POLL_MAX_FAILS )) && return 2
+    fi
     (( elapsed >= timeout )) && return 1
+    (( fails > 0 )) && echo "NOTE: operation poll failed ($fails of $POLL_MAX_FAILS consecutive); the operation may still be running — retrying in ${interval}s." >&2
     sleep "$interval"
     (( elapsed += interval ))
   done

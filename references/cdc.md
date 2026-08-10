@@ -47,7 +47,12 @@ A log-based flow has two separate levers managed through `bdi-cdc.sh`: the **CDC
 
 ### Enabling and disabling the CDC log
 
-`bdi-cdc.sh enable <flow-id>` / `disable <flow-id>` toggle the CDC log. Both are asynchronous: the API returns HTTP 202 with an operation that validates the source connection and the target file zone, and the operation can still settle to an error (e.g. an unreachable target bucket). A 202 is acceptance, not success — `bdi-cdc.sh` polls the operation to a terminal state and exits non-zero if it errors.
+`bdi-cdc.sh enable <flow-id>` / `disable <flow-id>` toggle the CDC log:
+
+- `enable` is asynchronous: the API returns HTTP 202 with an operation that validates the source connection and the target file zone, and the operation can still settle to an error (e.g. an unreachable target bucket). A 202 is acceptance, not success — `bdi-cdc.sh` polls the operation to a terminal state and exits non-zero if it errors.
+- `disable` may return HTTP 204 with an empty body and no operation — nothing to poll, so `bdi-cdc.sh` reports it complete and exits 0. When it returns 202 with an operation, the script polls it the same way it polls `enable`'s.
+
+Either way, confirm the resulting log state with `get` rather than inferring it from the exit code alone — and read *which* 400 it returns rather than treating any 400 as failure: "Enable log is off" means the log is off, while "has not retrieved any changes" means the log is on with no offset captured yet, which is the expected response right after `enable` on a flow whose source hasn't changed. `get` exits non-zero on either 400, so the message is the signal, not the exit code. Both are detailed under The offset cursor below.
 
 A settled operation diagnoses itself, so read its body before reaching for run logs: `error_message` gives the root cause in plain text (an inaccessible target bucket names the bucket and the S3 403), and `result`, keyed by the operation type, holds one entry per validation check whose `validation_status` is `success`, `failure`, or `pending` — a `pending` check never ran, so the failed check plus the pending ones show where it stopped. `bdi-cdc.sh` emits that body on stderr when it exits non-zero; `bdi-flow.sh operation <op-id>` fetches it for any operation id.
 
@@ -55,7 +60,7 @@ Enabling or disabling the CDC log does not change the flow's `river_status`, and
 
 ### The offset cursor
 
-Reading the offset requires the CDC log enabled; writing it does not. `bdi-cdc.sh get <flow-id>` returns it, and two distinct HTTP 400s mark the cases where it can't:
+Reading the offset requires the CDC log enabled; writing it does not. `bdi-cdc.sh get <flow-id>` returns it, and two distinct HTTP 400s mark the cases where it can't (`get` exits non-zero on both — the message is the signal):
 
 - `"Enable log is off for data flow cross id: …"` — the CDC log is disabled.
 - `"…the CDC connector has not retrieved any changes. A position will become available as soon as changes occur."` — the log is enabled but no offset has been captured yet (fresh, or just cleared).
