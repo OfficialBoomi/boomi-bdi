@@ -44,7 +44,7 @@ fetch_presigned() {
   local tmp code rc
   tmp=$(mktemp)
   set +e
-  code=$(curl -s --max-time 60 -o "$tmp" -w "%{http_code}" "$1")
+  code=$(curl_cfg url "$1" | curl -s --max-time 60 -K - -o "$tmp" -w "%{http_code}")
   rc=$?
   set -e
   local body; body=$(cat "$tmp"); rm -f "$tmp"
@@ -94,7 +94,7 @@ case "$sub" in
     # Hop 2: PUT the bytes to the presigned URL. NO auth — the URL carries its own signature.
     echo "upload slot acquired (file_id=$file_id); uploading bytes..." >&2
     set +e
-    put_code=$(curl -s --max-time 120 -o /dev/null -w "%{http_code}" --upload-file "$file" "$put_url")
+    put_code=$(curl_cfg url "$put_url" | curl -s --max-time 120 -o /dev/null -w "%{http_code}" -K - --upload-file "$file")
     put_rc=$?
     set -e
     if (( put_rc != 0 )) || [[ "$put_code" != 2?? ]]; then

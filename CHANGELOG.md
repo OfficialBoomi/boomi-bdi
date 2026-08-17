@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- Keep credentials and presigned URLs out of curl's command line
+
+
 ## 0.2.2
 
 - Skill folder now ships the changelog

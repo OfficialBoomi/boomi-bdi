@@ -70,6 +70,20 @@ bdi_root_url() {
 RESPONSE_BODY=""
 RESPONSE_CODE=""
 
+# Emits a curl config file on stdout for `curl -K -`, keeping credentials out of argv.
+# Usage: curl_cfg header "Authorization: Bearer t" url "https://..." | curl -K - ...
+curl_cfg() {
+  (( $# % 2 == 0 )) || { echo "ERROR: curl_cfg needs directive/value pairs" >&2; return 1; }
+  local val
+  while [[ $# -gt 1 ]]; do
+    val="$2"
+    val="${val//\\/\\\\}"
+    val="${val//\"/\\\"}"
+    printf '%s = "%s"\n' "$1" "$val"
+    shift 2
+  done
+}
+
 # Replace each "variables" object with a placeholder. Quote- and depth-aware: a value may hold a brace or a nested object.
 drop_variables() {
   awk '{ s = s (NR > 1 ? "\n" : "") $0 }
@@ -107,13 +121,14 @@ bdi_api() {
   local tmpfile rc
   tmpfile=$(mktemp)
   set +e
-  RESPONSE_CODE=$(curl -s \
-    --max-time 60 \
-    -A "$BDI_USER_AGENT" \
-    -H "Authorization: Bearer ${BDI_API_TOKEN}" \
-    ${ct_header[@]+"${ct_header[@]}"} \
-    -o "$tmpfile" -w "%{http_code}" \
-    "$@")
+  RESPONSE_CODE=$(curl_cfg header "Authorization: Bearer ${BDI_API_TOKEN}" \
+    | curl -s \
+        --max-time 60 \
+        -A "$BDI_USER_AGENT" \
+        -K - \
+        ${ct_header[@]+"${ct_header[@]}"} \
+        -o "$tmpfile" -w "%{http_code}" \
+        "$@")
   rc=$?
   set -e
   RESPONSE_BODY=$(cat "$tmpfile")
