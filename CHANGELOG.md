@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.5
+
+- Add worked incremental keyed-merge and log-CDC flow bodies
+- Correct source-to-target field, discriminator, and console details
+
+
+## 0.2.4
+
+- Keep credentials out of trace output
+- Remove response temp files on exit
+- Suppress false "more results exist" notes
+- Stop `--all` on an empty page
+
+
 ## 0.2.3
 
 - Keep credentials and presigned URLs out of curl's command line

@@ -42,12 +42,14 @@ json_str() {
 # args: <presigned-url>
 fetch_presigned() {
   local tmp code rc
-  tmp=$(mktemp)
+  xtrace_off   # guards the curl config built below: a presigned URL is a credential
+  tmp=$(mktemp "$_BDI_TMPDIR/presigned.XXXXXX")
   set +e
   code=$(curl_cfg url "$1" | curl -s --max-time 60 -K - -o "$tmp" -w "%{http_code}")
   rc=$?
   set -e
   local body; body=$(cat "$tmp"); rm -f "$tmp"
+  xtrace_on
   if (( rc != 0 )) || [[ "$code" != 2?? ]]; then
     echo "ERROR: fetching presigned URL failed (curl exit $rc, HTTP $code)." >&2
     echo "$body" >&2
@@ -63,9 +65,11 @@ print_presigned_content() {
   if (( RESPONSE_CODE < 200 || RESPONSE_CODE >= 300 )); then
     echo "ERROR: HTTP $RESPONSE_CODE" >&2; echo "$RESPONSE_BODY" >&2; exit 1
   fi
+  xtrace_off   # guards the presigned URL from extraction through the fetch
   local url; url=$(json_str "$RESPONSE_BODY" url)
   [[ -n "$url" ]] || { echo "ERROR: no presigned url in response." >&2; echo "$RESPONSE_BODY" >&2; exit 1; }
   fetch_presigned "$url"
+  xtrace_on
 }
 
 case "$sub" in
@@ -87,6 +91,7 @@ case "$sub" in
     if (( RESPONSE_CODE < 200 || RESPONSE_CODE >= 300 )); then
       echo "ERROR: HTTP $RESPONSE_CODE requesting upload slot." >&2; echo "$RESPONSE_BODY" >&2; exit 1
     fi
+    xtrace_off   # guards the upload-slot response body, which carries the presigned URL
     file_id=$(json_str "$RESPONSE_BODY" file_id)
     put_url=$(json_str "$RESPONSE_BODY" url)
     [[ -n "$file_id" && -n "$put_url" ]] || { echo "ERROR: upload-slot response missing file_id or url." >&2; echo "$RESPONSE_BODY" >&2; exit 1; }
@@ -97,6 +102,7 @@ case "$sub" in
     put_code=$(curl_cfg url "$put_url" | curl -s --max-time 120 -o /dev/null -w "%{http_code}" -K - --upload-file "$file")
     put_rc=$?
     set -e
+    xtrace_on
     if (( put_rc != 0 )) || [[ "$put_code" != 2?? ]]; then
       echo "ERROR: presigned PUT failed (curl exit $put_rc, HTTP $put_code) for file_id=$file_id." >&2
       exit 1

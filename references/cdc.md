@@ -2,6 +2,15 @@
 
 Change-data-capture behavior for source-to-target flows. CDC is selected by `extract_method:"log"` (see `source_to_target_authoring.md` for the surrounding load-mode fields).
 
+## Contents
+
+- Engaging CDC
+- Source-database prerequisites
+- CDC metadata columns
+- Delete handling on a warehouse merge
+- CDC offset and lifecycle
+- Worked example
+
 ## Engaging CDC
 
 - `extract_method:"log"` engages BDI's log-based CDC pipeline: a forward-only log-sequence cursor, no full snapshot. `extract_method:"cdc"` is **not** a valid value — it is rejected with HTTP 422, never silently treated as full or incremental.
@@ -78,3 +87,80 @@ A failed run (e.g. a target load error) does not advance the offset.
 ### Activation timing
 
 Activating a CDC flow (`bdi-flow.sh activate`) can take minutes while it validates the source and target connections. The activate poll may report a timeout while the underlying operation is still completing — re-check with `bdi-flow.sh operation <op-id>` or by re-reading `river_status` rather than treating the timeout as a failed activation. An operation carries its own status vocabulary rather than a run status: `D` is done and `E` is an error, both terminal, and any other value is still in progress. A timeout followed by `E` is a genuinely failed activation — the flow is down, not slow.
+
+## Worked example
+
+An MSSQL `orders` table streamed into Snowflake off the transaction log. Mirror the surrounding field grammar from `source_to_target_authoring.md`; what follows is specific to `log`.
+
+The create-time requirements are in Engaging CDC above. Two placement details those bullets don't cover: `cdc_settings` is a **sibling of `additional_settings` on the source block**, not a key inside it, and the per-table `cdc_settings` is a separate object, which accepts `initiate_table` and `overwrite_table_in_migration`.
+
+`modified_columns` is left empty here so the column set tracks the source rather than being pinned at authoring time. See `source_to_target_authoring.md` (Match/merge keys) for how an empty column list interacts with a keyed merge.
+
+A `log` flow **retains** the `log` you write at source level; `source_to_target_authoring.md` (`extract_method` (extraction)) covers what an unset source-level value does on a non-CDC flow. `source.additional_settings` is otherwise the same here: `datasource_id` and `connection_type` sent there are discarded and `source_type` is derived, so `extract_method` is the only key worth writing.
+
+On create the server fills the source-level `cdc_settings` out to `{default_tables_migration_option: "RUN_INITIAL_MIGRATION", include_snapshot_tables: true, datasource_id: "<source connector>"}`, adds `fix_invalid_characters: true` to `additional_settings`, and sets the table's `table_status` to `waiting_for_migration` (an incremental table reads back `tracked`).
+
+This example loads Snowflake with `merge` — read Delete handling on a warehouse merge above before relying on how a source DELETE lands here.
+
+```json
+{
+  "name": "MSSQL to Snowflake — orders (log CDC)",
+  "type": "source_to_target",
+  "metadata": {
+    "description": "Stream order changes from the MSSQL transaction log into Snowflake"
+  },
+  "settings": {
+    "run_timeout_seconds": 43200
+  },
+  "schedulers": [
+    { "cron_expression": "*/15 * * * *", "is_enabled": true }
+  ],
+  "properties": {
+    "properties_type": "source_to_target",
+    "source": {
+      "name": "mssql",
+      "connection_id": "<mssql connection id>",
+      "run_type": "multi_tables",
+      "cdc_settings": {},
+      "additional_settings": {
+        "extract_method": "log"
+      }
+    },
+    "target": {
+      "name": "snowflake",
+      "connection_id": "<snowflake connection id>",
+      "loading_method": "merge",
+      "merge_method": "merge",
+      "database_name": "DEMO_DB",
+      "schema_name": "PUBLIC",
+      "additional_settings": {}
+    },
+    "schemas": [
+      {
+        "name": "dbo",
+        "tables": [
+          {
+            "run_type_and_datasource": "multi_tables",
+            "details": {
+              "is_selected": true,
+              "name": "orders",
+              "target_table": "orders",
+              "extract_method": "log",
+              "incremental_field": null,
+              "date_range": null,
+              "running_number": null,
+              "epoch": null,
+              "cdc_settings": {},
+              "modified_columns": [],
+              "additional_source_settings": { "source_type": "mssql" },
+              "additional_target_settings": { "target_loading": "merge", "target_type": "snowflake", "merge_method": "merge" }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The flow is created `disabled`, and the source-side CDC requirement (see Source-database prerequisites) is an activation-gate — a create that succeeds says nothing about whether the source table has a capture instance. Expect `bdi-flow.sh activate` to take minutes, and read Activation timing above before treating a poll timeout as a failure.

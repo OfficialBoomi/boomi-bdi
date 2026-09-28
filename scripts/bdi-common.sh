@@ -3,6 +3,27 @@
 
 set -euo pipefail
 
+# Every site that expands a credential runs between these two. Mechanism and rationale: CLAUDE.md.
+_BDI_XTRACE=0
+_BDI_XTRACE_DEPTH=0
+xtrace_off() {
+  if (( _BDI_XTRACE_DEPTH == 0 )); then
+    case $- in *x*) _BDI_XTRACE=1 ;; *) _BDI_XTRACE=0 ;; esac
+  fi
+  _BDI_XTRACE_DEPTH=$(( _BDI_XTRACE_DEPTH + 1 ))
+  set +x
+}
+xtrace_on() {
+  if (( _BDI_XTRACE_DEPTH > 0 )); then
+    _BDI_XTRACE_DEPTH=$(( _BDI_XTRACE_DEPTH - 1 ))
+  fi
+  if (( _BDI_XTRACE_DEPTH == 0 && _BDI_XTRACE )); then set -x; fi
+}
+
+# Response bodies are written here; the trap bounds their lifetime on an interrupted call.
+_BDI_TMPDIR=$(mktemp -d)
+trap 'rm -rf "$_BDI_TMPDIR"' EXIT
+
 # A schemeless host makes curl fail in a way that looks like a network fault, and a trailing
 # slash builds //v1/... and 404s. Both are silent otherwise, so catch them at load time.
 normalize_api_url() {
@@ -21,20 +42,23 @@ normalize_api_url() {
 
 # The leading ./ is required: a bare `source .env` searches $PATH before the current directory.
 load_env() {
-  if [[ -f .env ]]; then
-    source ./.env
-  else
+  if [[ ! -f .env ]]; then
     echo "ERROR: .env file not found in $(pwd)" >&2
     exit 1
   fi
+  xtrace_off   # guards the .env load: sourcing it expands BDI_API_TOKEN
+  source ./.env
+  xtrace_on
   normalize_api_url
 }
 
 require_env() {
   local missing=()
+  xtrace_off   # guards the by-name test below, which expands BDI_API_TOKEN's value
   for var in "$@"; do
     [[ -z "${!var:-}" ]] && missing+=("$var")
   done
+  xtrace_on
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "ERROR: Missing required environment variables: ${missing[*]}" >&2
     echo "Check your .env file." >&2
@@ -107,10 +131,7 @@ drop_variables() {
 }
 
 bdi_api() {
-  # Disable xtrace so a caller's set -x can't leak the token.
-  local _xtrace_enabled=0
-  case $- in *x*) _xtrace_enabled=1 ;; esac
-  set +x
+  xtrace_off   # guards the Authorization header built below
 
   # Send JSON content type by default; omit it for -F/--form uploads so curl sets its own multipart boundary.
   local ct_header=(-H "Content-Type: application/json") _a
@@ -119,7 +140,7 @@ bdi_api() {
   done
 
   local tmpfile rc
-  tmpfile=$(mktemp)
+  tmpfile=$(mktemp "$_BDI_TMPDIR/response.XXXXXX")
   set +e
   RESPONSE_CODE=$(curl_cfg header "Authorization: Bearer ${BDI_API_TOKEN}" \
     | curl -s \
@@ -135,7 +156,7 @@ bdi_api() {
   [[ -n "${BDI_DROP_VARIABLES:-}" ]] && RESPONSE_BODY=$(printf '%s' "$RESPONSE_BODY" | drop_variables)
   rm -f "$tmpfile"
 
-  (( _xtrace_enabled )) && set -x
+  xtrace_on
 
   if (( rc != 0 )) || [[ -z "$RESPONSE_CODE" || "$RESPONSE_CODE" == "000" ]]; then
     echo "ERROR: no HTTP response from the BDI API within 60s (curl exit ${rc}; timeout, DNS, or no network)." >&2
@@ -151,6 +172,37 @@ paginate_next() {
     | grep -oE '"next_page"[[:space:]]*:[[:space:]]*"[^"]*"' \
     | head -1 \
     | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' || true
+}
+
+# True when the envelope's own row array is present and empty. Cursor endpoints return no
+# current_page_size, so this is the only emptiness signal available on that shape.
+# Depth- and quote-aware on purpose: a plain match would also hit an empty "items"/"data"
+# inside a row's payload, and reading that as an empty page would silently drop a real page
+# mid-traversal. Anything it can't parse reads as non-empty, so a surprise shape keeps going
+# rather than truncating.
+paginate_empty() {
+  [[ "$(printf '%s' "$1" | awk '{ s = s (NR > 1 ? "\n" : "") $0 }
+  END {
+    if (substr(s,1,1) != "{") { print "nonempty"; exit }
+    q=0; esc=0; d=0; key=""
+    for (i=1; i<=length(s); i++) {
+      c=substr(s,i,1)
+      if (q) {
+        if (esc) esc=0; else if (c=="\\") esc=1; else if (c=="\"") q=0; else key=key c
+        continue }
+      if (c=="\"") { q=1; key=""; continue }
+      if (c=="{" || c=="[") { d++
+        if (c=="[" && d==2 && (key=="items" || key=="data")) {
+          for (j=i+1; j<=length(s); j++) {
+            cc=substr(s,j,1)
+            if (cc==" " || cc=="\t" || cc=="\n" || cc=="\r") continue
+            if (cc=="]") { print "empty"; exit }
+            break } }
+        key=""; continue }
+      if (c=="}" || c=="]") { d--; key=""; continue }
+    }
+    print "nonempty"
+  }')" == "empty" ]]
 }
 
 # Extract a top-level numeric scalar (e.g. total_items, page, current_page_size).
@@ -207,6 +259,11 @@ paginate_get() {
     while [[ -n "$next" && "$count" -lt "$max" ]]; do
       # next_page is a full URL; if it omits items_per_page, later pages use the server default size (traversal still complete).
       bdi_api "$next"; _paginate_check || { printf ']\n'; exit 1; }
+      # A cursor can outlive the data: following it can return an empty page, which is terminal.
+      # Test both shapes — page-based envelopes carry current_page_size, cursor ones only the rows.
+      if [[ "$(paginate_num "$RESPONSE_BODY" current_page_size)" == "0" ]] || paginate_empty "$RESPONSE_BODY"; then
+        next=""; break
+      fi
       printf ',%s' "$RESPONSE_BODY"
       count=$((count + 1)); next=$(paginate_next "$RESPONSE_BODY")
     done
@@ -221,14 +278,26 @@ paginate_get() {
   local next; next=$(paginate_next "$RESPONSE_BODY")
   if [[ -n "$next" ]]; then
     # Cursor endpoints (e.g. audit) lack page/total/size; use the detailed NOTE only when present.
-    local pg tot sz
+    local pg tot sz seen=""
     pg=$(paginate_num "$RESPONSE_BODY" page)
     tot=$(paginate_num "$RESPONSE_BODY" total_items)
     sz=$(paginate_num "$RESPONSE_BODY" current_page_size)
+    # Items seen = whole pages before this one, at the requested stride, plus this page's actual
+    # count. current_page_size is what came back, not what was asked for, so multiplying it by the
+    # page number under-counts a short final page. Past page 1 this assumes the endpoint honored
+    # items_per_page; where it didn't, seen overshoots and a real note is suppressed — the quiet
+    # direction. 10# keeps a zero-padded --items out of octal.
     if [[ -n "$pg" && -n "$tot" && -n "$sz" ]]; then
-      echo "NOTE: page $pg of $tot total_items (page size $sz); more pages exist. Use --all, or --page N / --items N." >&2
+      if (( pg == 1 )); then
+        seen="$sz"
+      elif [[ -n "${PG_ITEMS:-}" ]]; then
+        seen=$(( (pg - 1) * 10#$PG_ITEMS + sz ))
+      fi
+    fi
+    if [[ -n "$seen" ]]; then
+      (( seen < tot )) && echo "NOTE: page $pg of $tot total_items; more pages exist. Use --all, or --page N / --items N." >&2
     else
-      echo "NOTE: more results exist. Use --all to fetch them all." >&2
+      echo "NOTE: a next_page cursor is present, so more results may exist — following it can also return nothing. Use --all to fetch them all." >&2
     fi
   fi
   return 0

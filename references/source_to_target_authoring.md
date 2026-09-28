@@ -59,7 +59,7 @@ If your agent platform supports subagents and the user prefers that workflow, yo
 
 ## Connector discriminator
 
-The source and target connector types are set by a discriminator `name` — `properties.source_to_target.source.name` and `.target.name` — which must be the lowercase `api_name`, not the title-cased label `bdi-connection.sh list` shows (e.g. `mysql`, not `MySQL`). A non-canonical value is rejected with HTTP 422 `union_tag_invalid`. The top-level `source.name` propagates into the per-table discriminator at `schemas[].tables[].details.additional_source_settings.source_type`, so a bad top-level value surfaces as a per-table error there. Take the canonical name from `bdi-connection.sh source-types`/`target-types` (which return `api_name`s), not from the connection `list` label.
+The source and target connector types are set by a discriminator `name` — `properties.source.name` and `properties.target.name` — which must be the lowercase `api_name`, not the title-cased label `bdi-connection.sh list` shows (e.g. `mysql`, not `MySQL`). A non-canonical value is rejected with HTTP 422 `union_tag_invalid`. The top-level `source.name` propagates into the per-table discriminator at `schemas[].tables[].details.additional_source_settings.source_type`, so a bad top-level value surfaces as a per-table error there. Take the canonical name from `bdi-connection.sh source-types`/`target-types` (which return `api_name`s), not from the connection `list` label.
 
 To resolve the discriminator for a specific connection, match its `connection_type` (the machine slug from `bdi-connection.sh get`, or `connection_type_id` from `list`) against the `connection_type` of a `source-types` entry whose `segment` includes `source`, and take that entry's `api_name`. The slug is frequently not the `api_name` — `snowflake_src` resolves to `snowflake` — and one slug can carry both a source and a target entry (a `postgres` connection resolves to the source entry's `postgresql`, not the target-only `postgres_rds`), which the `source` segment filter disambiguates. A slug whose only entries lack the `source` segment is target-only and has no source discriminator.
 
@@ -85,7 +85,7 @@ An insert-only (append) load paired with incremental extraction never updates ex
 
 Enum: `all`, `incremental`, `log`, `change_tracking`, `system_versioning`. Any other value is rejected with HTTP 422 (it is not silently demoted). `log` selects log-based CDC — see `cdc.md`.
 
-`extract_method` appears in two places in the flow body: per table in `tables[].details` (alongside the cursor containers below), and at source level in `properties.source.additional_settings`. The two are stored independently — writing one does not change the other — and the source-level field can read back as `increment` rather than `incremental` after a write. Set and read the per-table field. Exception: for `extract_method: log`, the source-level and per-table values must both be `log` at create — a per-table `log` with the source-level field unset is rejected with HTTP 422 (see `cdc.md`).
+`extract_method` appears in two places in the flow body: per table in `tables[].details` (alongside the cursor containers below), and at source level in `properties.source.additional_settings`. The two are stored independently — writing one does not change the other — and the source-level field can read back as `increment` rather than `incremental` after a write. Set and read the per-table field. A source-level value left unset defaults to `all`, regardless of how the tables extract. Exception: for `extract_method: log`, the source-level and per-table values must both be `log` at create — a per-table `log` with the source-level field unset is rejected with HTTP 422 (see `cdc.md`).
 
 Switching a table to `extract_method: all` requires clearing its `incremental_field` in the same body — leaving both is rejected with HTTP 422 (`Incremental field cannot be set if extract method is 'all'`).
 
@@ -98,6 +98,8 @@ Switching a table to `extract_method: all` requires clearing its `incremental_fi
 
 Other targets (e.g. Redshift) carry their own set. For a target other than Snowflake or PostgreSQL, confirm its accepted `merge_method` before relying on one — a wrong value is rejected at create with HTTP 422.
 
+`merge_method` sits in two places — on the target block and in each table's `additional_target_settings` — and they read back differently. Omit it on the target block and the server fills the value in; omit it per-table and it is stored as `null`. Set both, so the stored body names the method each table loads with.
+
 ## Incremental extraction
 
 For a database source, discover a table's cursor candidates with `bdi-connection.sh tables <connection-id>`: each table lists its cursor-eligible columns in `increment_columns[]` (name, type, `incremental_type`).
@@ -105,7 +107,7 @@ For a database source, discover a table's cursor candidates with `bdi-connection
 When `extract_method` is `incremental`, the cursor type is one of `datetime`, `runningnumber`, `epoch`, `row_version`. The type is **not** a directly settable field — sending an `incremental_type` field is rejected (`extra_forbidden`). Instead the type is implied by which interval container is populated in the table details: `date_range` (datetime), `running_number`, or `epoch`.
 
 - A `running_number` container carries `start_value`, `end_value`, `rows_in_chunk`, and `include_end_value`; sending just `{"start_value": 0}` is accepted, and the API fills in the remaining fields.
-- A `datetime` incremental requires an explicit `start_date`. A null start activates but fails at run time ("no start date/time set") — the cursor does not self-seed. The `date_range` container also accepts `days_back` (a rolling N-day window) and `include_end_value` (end-inclusive window).
+- A `datetime` incremental requires an explicit `start_date`. A null start activates but fails at run time ("no start date/time set") — the cursor does not self-seed. The `date_range` container also accepts `days_back` (a rolling N-day window) and `include_end_value` (end-inclusive window). `start_date` accepts `"YYYY-MM-DD HH:MM:SS"` and normalizes it on the way in, so a read-back returns the ISO-8601 form (`"2026-01-01T00:00:00.000+0000"`); PUTting that normalized form back is also accepted, which keeps a read-modify-write roundtrip stable.
 - The cursor auto-advances: each run's start value becomes the prior run's end value. The high-water mark for a datetime cursor persists in `date_range.start_date`.
 - By default a failed run does **not** advance the cursor, so a rerun re-covers the same window. Setting `update_increment_on_failures: true` (in `date_range`, default `false`) advances the cursor even on failure, which can skip the failed window's data — leave it off unless you specifically want that.
 - The extraction window is half-open `[start, end)` — start-inclusive, end-exclusive.
@@ -183,11 +185,11 @@ A quick pass over the body catches the silent-failure cases documented above:
 
 ## Worked examples
 
-Two minimal bodies to mirror. Both create `disabled` (a source-to-target flow is forced disabled at create); activate with `bdi-flow.sh activate` once the source and target connections are reachable. Replace the `<...>` placeholders with real connection ids and names.
+Three bodies to mirror. All create `disabled` (a source-to-target flow is forced disabled at create); activate with `bdi-flow.sh activate` once the source and target connections are reachable. Replace the `<...>` placeholders with real connection ids and names.
 
 ### Native database source → Snowflake (full extract)
 
-A PostgreSQL table loaded whole into Snowflake on each run — `run_type: multi_tables`, per-table `extract_method: all`, `loading_method: overwrite`. The source table is selected under `schemas[]`; `modified_columns` is left empty to take the table's full column set. The `source.additional_settings` block shown is optional — the API derives it from `source.name` and the connection when omitted.
+A PostgreSQL table loaded whole into Snowflake on each run — `run_type: multi_tables`, per-table `extract_method: all`, `loading_method: overwrite`. The source table is selected under `schemas[]`; `modified_columns` is left empty to take the table's full column set. `source.additional_settings` is left empty: the API derives `source_type` from `source.name` and the connection, and `datasource_id`/`connection_type` sent here are discarded.
 
 ```json
 {
@@ -206,10 +208,7 @@ A PostgreSQL table loaded whole into Snowflake on each run — `run_type: multi_
       "name": "postgresql",
       "connection_id": "<postgresql connection id>",
       "run_type": "multi_tables",
-      "additional_settings": {
-        "datasource_id": "postgresql",
-        "connection_type": "postgresql"
-      }
+      "additional_settings": {}
     },
     "target": {
       "name": "snowflake",
@@ -245,6 +244,82 @@ A PostgreSQL table loaded whole into Snowflake on each run — `run_type: multi_
   }
 }
 ```
+
+### Native database source → Snowflake (incremental cursor, keyed merge)
+
+The current-state counterpart to the example above: only rows whose `updated_at` moved are extracted, and they upsert into the existing target table instead of replacing it. Diff it against the full-extract body — the connections and table selection are identical, and only the extract/load machinery and the schedule change.
+
+Three things move together, each covered in its own section above: `extract_method: "incremental"` with an `incremental_field` and exactly one populated interval container (see Incremental extraction), `loading_method: "merge"` with a `merge_method` in both positions (see `merge_method` (load strategy)), and an `is_key` column (see Match/merge keys). Before you create or activate walks all three.
+
+Each `modified_columns` entry requires only `is_selected` and `name`. `type` is optional and stored as `null` when omitted, as here. If you populate it, take the value from `bdi-connection.sh columns` (see `data_discovery.md`) rather than writing a target DDL type by hand.
+
+```json
+{
+  "name": "Postgres to Snowflake — orders (incremental merge)",
+  "type": "source_to_target",
+  "metadata": {
+    "description": "Upsert changed orders into Snowflake on an updated_at cursor"
+  },
+  "settings": {
+    "run_timeout_seconds": 43200
+  },
+  "schedulers": [
+    { "cron_expression": "0 2 * * *", "is_enabled": true }
+  ],
+  "properties": {
+    "properties_type": "source_to_target",
+    "source": {
+      "name": "postgresql",
+      "connection_id": "<postgresql connection id>",
+      "run_type": "multi_tables",
+      "additional_settings": {}
+    },
+    "target": {
+      "name": "snowflake",
+      "connection_id": "<snowflake connection id>",
+      "loading_method": "merge",
+      "merge_method": "merge",
+      "database_name": "DEMO_DB",
+      "schema_name": "PUBLIC",
+      "additional_settings": {}
+    },
+    "schemas": [
+      {
+        "name": "public",
+        "tables": [
+          {
+            "run_type_and_datasource": "multi_tables",
+            "details": {
+              "is_selected": true,
+              "name": "orders",
+              "target_table": "orders",
+              "extract_method": "incremental",
+              "incremental_field": "updated_at",
+              "date_range": {
+                "start_date": "<cursor start, e.g. 2026-01-01 00:00:00>",
+                "update_increment_on_failures": false
+              },
+              "running_number": null,
+              "epoch": null,
+              "modified_columns": [
+                { "is_selected": true, "name": "id", "is_key": true },
+                { "is_selected": true, "name": "customer_id" },
+                { "is_selected": true, "name": "order_total" },
+                { "is_selected": true, "name": "status" },
+                { "is_selected": true, "name": "updated_at" }
+              ],
+              "additional_source_settings": { "source_type": "postgresql" },
+              "additional_target_settings": { "target_loading": "merge", "target_type": "snowflake", "merge_method": "merge" }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The schedule is `is_enabled: true` here, but the flow is still created `disabled` — an enabled schedule only begins firing once you activate.
 
 ### Custom-report (SaaS) source → Snowflake
 
